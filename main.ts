@@ -28,17 +28,19 @@ const DEFAULTS = {
   seed: 20261112,
   paths: 4000,
   // incumbent kernel (log10 cap in SOL), horizon H in hours
-  muA: -0.03, // alive drift per H^bMu at x0 = 3.5
-  bMu: 0.75,
-  muLevel: -0.03, // extra drift per unit of (x0 - 3.5), per H^bMu
+  muA: -0.006, // alive drift per H^bMu at x0 = 3.5
+  bMu: 1.0,
+  muLevel: -0.004, // extra drift per unit of (x0 - 3.5), per H^bMu
   muDD: 0.0, // per unit of drawdown from the coin's peak, per H^bMu
   muMom: 0.1, // times the last hour's log change (not horizon-scaled)
-  sig: 0.13, // sd per H^bSig
-  bSig: 0.5,
+  sig: 0.12, // sd per H^bSig for a coin 3+ hours old
+  bSig: 0.25,
+  youth: 0.8, // sd multiplier 1 + youth * exp(-age / youthTau)
+  youthTau: 2.0,
   nu: 4,
-  crashRate: 0.035, // hazard per hour
-  crashMean: -1.0,
-  crashSd: 0.45,
+  crashRate: 0.03, // hazard per hour
+  crashMean: -1.6,
+  crashSd: 0.6,
   curveSigMult: 1.5,
   curveCrashMult: 2.0,
   sigM: 0.035, // market factor sd per sqrt hour
@@ -51,6 +53,14 @@ const DEFAULTS = {
   tailPriorMean: 0.45,
   tailPriorN: 4,
   fallbackRate: 3.0, // field coins above fieldLo per hour when the history has none
+  // runtime self-calibration of sig and crashRate from the history (weight calW, prior strength calN0 pairs)
+  calW: 0.5,
+  calN0: 150,
+  calLagH: 1.0,
+  calWindowH: 6,
+  calTop: 40,
+  calLo: 3.0,
+  calCrash: 0.8,
   // output
   shrink: 0.04,
   temper: 1.0,
@@ -210,6 +220,13 @@ function persistence(): Forecast {
   return { probabilities, top5, sizes };
 }
 
+/** A coin's age in hours at time t (hours since t0), from its CreateEvent time (else taken as 2 hours). */
+function ageOf(r: Row, t: number): number {
+  const c = r.created_at ? (Date.parse(r.created_at) - t0) / HOUR : NaN;
+  return Number.isFinite(c) ? Math.max(0, t - c) : 2;
+}
+const ageMult = (age: number): number => 1 + P.youth * Math.exp(-age / P.youthTau);
+
 function model(): Forecast {
   if (marks.length === 0) throw new Error('no marks');
   const last = marks[marks.length - 1]!;
@@ -223,6 +240,52 @@ function model(): Forecast {
       if (!s) series.set(r.mint, (s = []));
       s.push({ t: m.t, x: lg(r.market_cap_lamports) });
     }
+  }
+
+  // self-calibration: the history's own recent volatility and crash rate for coins in contention, blended with the priors
+  if (P.calW > 0 && marks.length >= 3) {
+    const cadence = (T - marks[0]!.t) / Math.max(1, marks.length - 1);
+    const lagH = Math.min(P.calLagH, Math.max(cadence, (T - marks[0]!.t) / 2));
+    const devs: number[] = [];
+    let crashes = 0;
+    let n = 0;
+    for (let a = 0; a < marks.length; a++) {
+      const ma = marks[a]!;
+      if (ma.t < T - P.calWindowH - lagH) continue;
+      let b = a + 1;
+      while (b < marks.length && marks[b]!.t < ma.t + lagH - 1e-6) b++;
+      if (b >= marks.length) break;
+      const mb = marks[b]!;
+      const h = mb.t - ma.t;
+      if (h <= 0) continue;
+      const at = new Map<string, number>();
+      for (const r of mb.rows) at.set(r.mint, lg(r.market_cap_lamports));
+      const floorB = mb.rows.length >= 150 ? lg(mb.rows[mb.rows.length - 1]!.market_cap_lamports) : -Infinity;
+      for (const r of ma.rows.slice(0, P.calTop)) {
+        const x = lg(r.market_cap_lamports);
+        if (x < P.calLo) continue;
+        const y = at.get(r.mint);
+        n++;
+        if (y === undefined) {
+          if (x - floorB > P.calCrash) crashes++;
+          continue;
+        }
+        if (y - x < -P.calCrash) crashes++;
+        else devs.push((y - x) / Math.pow(h, P.bSig) / ageMult(ageOf(r, ma.t)));
+      }
+    }
+    if (devs.length >= 8) {
+      const med = [...devs].sort((p, q) => p - q)[devs.length >> 1]!;
+      const mad = [...devs.map((d) => Math.abs(d - med))].sort((p, q) => p - q)[devs.length >> 1]!;
+      const sigHat = (1.4826 * mad) / Math.sqrt(P.nu / (P.nu - 2)) / 0.85; // t(nu) has a smaller MAD than its sd
+      const w = (P.calW * devs.length) / (devs.length + P.calN0);
+      P.sig = Math.exp((1 - w) * Math.log(P.sig) + w * Math.log(Math.min(Math.max(sigHat, P.sig / 3), P.sig * 3)));
+      const f = Math.min(0.9, crashes / Math.max(1, n));
+      const lamHat = -Math.log(1 - f) / lagH;
+      const wc = (P.calW * n) / (n + P.calN0);
+      P.crashRate = Math.exp((1 - wc) * Math.log(P.crashRate) + wc * Math.log(Math.min(Math.max(lamHat, P.crashRate / 4), P.crashRate * 4)));
+      if (process.env.FC_DEBUG) process.stderr.write(`selfcal lag ${lagH.toFixed(2)}h pairs ${n} sigHat ${sigHat.toFixed(3)} crash ${f.toFixed(3)} -> sig ${P.sig.toFixed(3)} crashRate ${P.crashRate.toFixed(3)}\n`);
+    } else if (process.env.FC_DEBUG) process.stderr.write(`selfcal skipped: ${devs.length} pairs\n`);
   }
 
   // incumbents: the last mark's ranked coins
@@ -240,7 +303,7 @@ function model(): Forecast {
       }
     }
     const complete = r.complete === true || r.venue === 'pool' || r.venue === 'migrating';
-    return { mint: r.mint, x0, dd: peak - x0, mom: x0 - ref, complete };
+    return { mint: r.mint, x0, dd: peak - x0, mom: x0 - ref, complete, sdMult: ageMult(ageOf(r, T)) * (complete ? 1 : P.curveSigMult) };
   });
   const NC = cand.length;
 
@@ -306,7 +369,7 @@ function model(): Forecast {
         const pc = c.complete ? pcBase : pcCurve;
         let x: number;
         if (rand() < pc) x = c.x0 + P.crashMean + P.crashSd * gauss();
-        else x = c.x0 + mu[i]! + sdBase * (c.complete ? 1 : P.curveSigMult) * tUnit(P.nu);
+        else x = c.x0 + mu[i]! + sdBase * c.sdMult * tUnit(P.nu);
         x += MF;
         xs[i] = x;
         push(x, i);
@@ -408,6 +471,7 @@ function model(): Forecast {
     for (let i = 0; i < NC; i++) if (!top5.includes(cand[i]!.mint) && (bi < 0 || qAt[k]![i]! > qAt[k]![bi]!)) bi = i;
     if (bi >= 0) top5.push(cand[bi]!.mint);
   }
+  for (const mint of series.keys()) if (top5.length < PLACES && !top5.includes(mint)) top5.push(mint);
   if (top5.length < PLACES) throw new Error('fewer than 5 coins');
   return { probabilities, top5, sizes };
 }

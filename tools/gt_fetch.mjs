@@ -38,6 +38,7 @@ if (Object.keys(pools).length === 0) {
   writeFileSync(join(OUT, 'pools.json'), JSON.stringify(pools, null, 1));
 }
 for (const addr of Object.keys(pools)) {
+  if (!pools[addr].name.endsWith('/ SOL')) continue; // pump coins quoted in SOL only
   const f = join(OUT, 'ohlcv', addr + '.json');
   if (existsSync(f)) continue;
   const d = await get(`${BASE}/networks/solana/pools/${addr}/ohlcv/hour?aggregate=1&limit=1000&currency=token`);
