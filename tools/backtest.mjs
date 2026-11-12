@@ -28,6 +28,8 @@ for (const [addr, p] of Object.entries(pools)) {
   if (!Array.isArray(list) || list.length === 0) continue;
   const close = new Map();
   for (const c of list) close.set(c[0] * 1000, +c[4]);
+  // copycat pools with implausible caps (10^5.6 SOL and up) are left out
+  if ([...close.values()].some((px) => Math.log10(px * 1e9) > Number(process.env.BT_MAXCAP ?? 5.6))) continue;
   coins.push({ mint: p.mint, name: p.name, created: Date.parse(p.created), close });
 }
 /** log10 cap in SOL at instant t: the close of the hourly candle that ended at t (or the latest before it, up to 3 h). */

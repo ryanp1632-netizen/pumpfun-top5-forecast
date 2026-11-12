@@ -38,7 +38,7 @@ const DEFAULTS = {
   youth: 0.8, // sd multiplier 1 + youth * exp(-age / youthTau)
   youthTau: 2.0,
   nu: 4,
-  crashRate: 0.035, // base hazard per hour
+  crashRate: 0.05, // base hazard per hour
   youthHaz: 0.25, // extra hazard per hour at age 0, decaying as exp(-age / youthHazTau)
   youthHazTau: 1.5,
   crashMean: -1.6,
@@ -49,7 +49,7 @@ const DEFAULTS = {
   // newcomers
   fieldLo: 2.8,
   a0: 1.4, // the newcomer window (13:00 to 02:00 UTC) spans US hours, busier than the history's 02:00 to 13:00
-  sA: 0.4,
+  sA: 0.5,
   jitter: 0.15,
   tailMix: 0.5,
   tailPriorMean: 0.45,
@@ -68,8 +68,8 @@ const DEFAULTS = {
   temper: 1.0,
   pMin: 1e-4,
   maxRows: 100,
-  sizeKernel: 0.07,
-  sizeWide: 0.04,
+  sizeKernel: 0.1,
+  sizeWide: 0.08,
   sizeWideSd: 0.5,
 };
 
