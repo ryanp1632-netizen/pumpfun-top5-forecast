@@ -21,6 +21,7 @@ const HOUR = 3_600_000;
 const pools = JSON.parse(readFileSync(join(DATA, 'pools.json'), 'utf8'));
 const coins = [];
 for (const [addr, p] of Object.entries(pools)) {
+  if (!p.name.endsWith('/ SOL')) continue; // pump coins quoted in SOL only (other quotes are copycat pools)
   const f = join(DATA, 'ohlcv', addr + '.json');
   if (!existsSync(f)) continue;
   const list = JSON.parse(readFileSync(f, 'utf8'));
@@ -150,8 +151,13 @@ for (const t0s of T0S) {
   for (const entry of ENTRIES) {
     const out = join(dir, 'out-' + entry.replace(/[^a-z0-9]/gi, '_'));
     mkdirSync(out, { recursive: true });
-    execFileSync('node', [entry], { env: { ...process.env, MAKEFUN_INPUT_DIR: join(dir, 'input'), MAKEFUN_OUTPUT_DIR: out }, stdio: ['ignore', 'ignore', 'inherit'] });
-    const fc = JSON.parse(readFileSync(join(out, 'forecast.json'), 'utf8'));
+    let fc = { probabilities: [], sizes: [] };
+    try {
+      execFileSync('node', [entry], { env: { ...process.env, MAKEFUN_INPUT_DIR: join(dir, 'input'), MAKEFUN_OUTPUT_DIR: out }, stdio: ['ignore', 'ignore', 'ignore'] });
+      fc = JSON.parse(readFileSync(join(out, 'forecast.json'), 'utf8'));
+    } catch {
+      // a failed entry scores the even spread (the empty forecast)
+    }
     results[t0s][entry] = score(fc, charts);
   }
 }

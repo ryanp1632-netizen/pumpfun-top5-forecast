@@ -34,11 +34,13 @@ const DEFAULTS = {
   muDD: 0.0, // per unit of drawdown from the coin's peak, per H^bMu
   muMom: 0.1, // times the last hour's log change (not horizon-scaled)
   sig: 0.12, // sd per H^bSig for a coin 3+ hours old
-  bSig: 0.25,
+  bSig: 0.2,
   youth: 0.8, // sd multiplier 1 + youth * exp(-age / youthTau)
   youthTau: 2.0,
   nu: 4,
-  crashRate: 0.03, // hazard per hour
+  crashRate: 0.035, // base hazard per hour
+  youthHaz: 0.25, // extra hazard per hour at age 0, decaying as exp(-age / youthHazTau)
+  youthHazTau: 1.5,
   crashMean: -1.6,
   crashSd: 0.6,
   curveSigMult: 1.5,
@@ -46,7 +48,7 @@ const DEFAULTS = {
   sigM: 0.035, // market factor sd per sqrt hour
   // newcomers
   fieldLo: 2.8,
-  a0: 1.25,
+  a0: 1.4, // the newcomer window (13:00 to 02:00 UTC) spans US hours, busier than the history's 02:00 to 13:00
   sA: 0.4,
   jitter: 0.15,
   tailMix: 0.5,
@@ -226,6 +228,8 @@ function ageOf(r: Row, t: number): number {
   return Number.isFinite(c) ? Math.max(0, t - c) : 2;
 }
 const ageMult = (age: number): number => 1 + P.youth * Math.exp(-age / P.youthTau);
+/** The cumulative crash hazard over h hours for a coin aged `age`: a base rate plus a youth hazard that decays with age. */
+const cumHaz = (age: number, h: number): number => P.crashRate * h + P.youthHaz * P.youthHazTau * (Math.exp(-age / P.youthHazTau) - Math.exp(-(age + h) / P.youthHazTau));
 
 function model(): Forecast {
   if (marks.length === 0) throw new Error('no marks');
@@ -248,6 +252,7 @@ function model(): Forecast {
     const lagH = Math.min(P.calLagH, Math.max(cadence, (T - marks[0]!.t) / 2));
     const devs: number[] = [];
     let crashes = 0;
+    let expected = 0;
     let n = 0;
     for (let a = 0; a < marks.length; a++) {
       const ma = marks[a]!;
@@ -266,6 +271,7 @@ function model(): Forecast {
         if (x < P.calLo) continue;
         const y = at.get(r.mint);
         n++;
+        expected += 1 - Math.exp(-cumHaz(ageOf(r, ma.t), h));
         if (y === undefined) {
           if (x - floorB > P.calCrash) crashes++;
           continue;
@@ -280,11 +286,13 @@ function model(): Forecast {
       const sigHat = (1.4826 * mad) / Math.sqrt(P.nu / (P.nu - 2)) / 0.85; // t(nu) has a smaller MAD than its sd
       const w = (P.calW * devs.length) / (devs.length + P.calN0);
       P.sig = Math.exp((1 - w) * Math.log(P.sig) + w * Math.log(Math.min(Math.max(sigHat, P.sig / 3), P.sig * 3)));
-      const f = Math.min(0.9, crashes / Math.max(1, n));
-      const lamHat = -Math.log(1 - f) / lagH;
+      // the crash hazard scales by observed / expected crashes (ages and the lag accounted for), shrunk toward 1
+      const ratio = Math.min(2.5, Math.max(0.4, (crashes + 2) / (expected + 2)));
       const wc = (P.calW * n) / (n + P.calN0);
-      P.crashRate = Math.exp((1 - wc) * Math.log(P.crashRate) + wc * Math.log(Math.min(Math.max(lamHat, P.crashRate / 4), P.crashRate * 4)));
-      if (process.env.FC_DEBUG) process.stderr.write(`selfcal lag ${lagH.toFixed(2)}h pairs ${n} sigHat ${sigHat.toFixed(3)} crash ${f.toFixed(3)} -> sig ${P.sig.toFixed(3)} crashRate ${P.crashRate.toFixed(3)}\n`);
+      const mult = Math.exp(wc * Math.log(ratio));
+      P.crashRate *= mult;
+      P.youthHaz *= mult;
+      if (process.env.FC_DEBUG) process.stderr.write(`selfcal lag ${lagH.toFixed(2)}h pairs ${n} sigHat ${sigHat.toFixed(3)} crashes ${crashes} expected ${expected.toFixed(1)} -> sig ${P.sig.toFixed(3)} hazard x${mult.toFixed(2)}\n`);
     } else if (process.env.FC_DEBUG) process.stderr.write(`selfcal skipped: ${devs.length} pairs\n`);
   }
 
@@ -303,7 +311,7 @@ function model(): Forecast {
       }
     }
     const complete = r.complete === true || r.venue === 'pool' || r.venue === 'migrating';
-    return { mint: r.mint, x0, dd: peak - x0, mom: x0 - ref, complete, sdMult: ageMult(ageOf(r, T)) * (complete ? 1 : P.curveSigMult) };
+    return { mint: r.mint, x0, dd: peak - x0, mom: x0 - ref, complete, age: ageOf(r, T), sdMult: ageMult(ageOf(r, T)) * (complete ? 1 : P.curveSigMult) };
   });
   const NC = cand.length;
 
@@ -342,8 +350,7 @@ function model(): Forecast {
     const H = Math.max(readsAt[r]! - T, 1 / 60);
     const muScale = Math.pow(H, P.bMu);
     const sdBase = P.sig * Math.pow(H, P.bSig);
-    const pcBase = 1 - Math.exp(-P.crashRate * H);
-    const pcCurve = 1 - Math.exp(-P.crashRate * P.curveCrashMult * H);
+    const pcs = cand.map((c) => 1 - Math.exp(-cumHaz(c.age, H) * (c.complete ? 1 : P.curveCrashMult)));
     const sdM = P.sigM * Math.sqrt(H);
     const mu = cand.map((c) => (P.muA + P.muLevel * (c.x0 - 3.5) + P.muDD * c.dd) * muScale + P.muMom * c.mom);
     const f = fields[r]!;
@@ -366,7 +373,7 @@ function model(): Forecast {
       };
       for (let i = 0; i < NC; i++) {
         const c = cand[i]!;
-        const pc = c.complete ? pcBase : pcCurve;
+        const pc = pcs[i]!;
         let x: number;
         if (rand() < pc) x = c.x0 + P.crashMean + P.crashSd * gauss();
         else x = c.x0 + mu[i]! + sdBase * c.sdMult * tUnit(P.nu);
